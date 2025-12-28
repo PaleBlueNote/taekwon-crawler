@@ -1,108 +1,95 @@
-import time
+import os
 import requests
-import json
 import urllib.parse
 from bs4 import BeautifulSoup
-from datetime import datetime
+from supabase import create_client
+from datetime import datetime, timedelta, timezone
 
-# --- 설정 파일 관리 ---
-CONFIG_FILE = 'config.json'
+# --- Supabase 설정 ---
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def load_config():
-    try:
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        # 기본 설정 생성
-        default_config = {
-            "is_active": True,
-            "interval_seconds": 60,
-            "discord_url": "YOUR_DISCORD_WEBHOOK_URL",
-            "regions": ["서울", "경기"],
-            "keywords": ["사범"],
-            "last_id": 0
-        }
-        save_config(default_config)
-        return default_config
+# --- 한국 시간 구하기 ---
+KST = timezone(timedelta(hours=9))
 
-def save_config(config):
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=4, ensure_ascii=False)
+def send_discord(webhook_url, msg):
+    if webhook_url and "http" in webhook_url:
+        try:
+            requests.post(webhook_url, json={"content": msg})
+        except: pass
 
-# --- 디스코드 알림 ---
-def send_discord_alert(webhook_url, msg):
-    if not webhook_url or "YOUR" in webhook_url:
-        print("디스코드 URL이 설정되지 않았습니다.")
+def main():
+    # 1. 내 설정 가져오기 (ID가 'admin'인 행)
+    response = supabase.table('my_config').select("*").eq('uid', 'admin').execute()
+    if not response.data:
+        print("DB에 계정이 없습니다.")
         return
 
-    data = {"content": msg}
-    requests.post(webhook_url, json=data)
+    user = response.data[0]
 
-# --- 크롤러 핵심 ---
-def crawl_job_board():
-    config = load_config()
-    current_max_id = config['last_id']
-    found_max_id = current_max_id
+    # 2. ON/OFF 체크
+    if not user['is_active']:
+        print("⛔ 크롤링이 꺼져 있습니다. (OFF)")
+        return
 
+    # 3. 시간 간격 체크 (쿨타임)
+    last_run = datetime.fromisoformat(user['last_run_at'].replace('Z', '+00:00'))
+    now = datetime.now(timezone.utc)
+    # 설정된 분(min)보다 적게 지났으면 스킵
+    if (now - last_run).total_seconds() < (user['check_interval_min'] * 60):
+        print(f"⏳ 아직 쿨타임입니다. (설정: {user['check_interval_min']}분 간격)")
+        return
+
+    print(f"🚀 크롤링 시작! (타겟: {user['regions']})")
+
+    # --- 크롤링 로직 시작 ---
     base_url = "https://www.taekwonstory.com/bbs/board.php"
+    found_max_id = user['last_id']
+    new_posts_count = 0
 
-    print(f"[{datetime.now()}] 크롤링 시작... (대상: {config['regions']})")
-
-    for region in config['regions']:
+    for region in user['regions']:
         try:
-            # URL 인코딩 및 요청
-            encoded_region = urllib.parse.quote(region)
+            encoded_region = urllib.parse.quote(region) if region != "전체" else ""
             url = f"{base_url}?bo_table=guin&wr_1={encoded_region}"
-            response = requests.get(url)
-            soup = BeautifulSoup(response.text, 'html.parser')
 
-            # 게시글 목록 파싱 (실제 CSS 선택자는 개발자 도구 확인 필요)
-            # 예시: tr 태그 안에 있는 리스트라고 가정
+            resp = requests.get(url)
+            soup = BeautifulSoup(resp.text, 'html.parser')
             rows = soup.select('form[name="fboardlist"] tbody tr')
 
             for row in rows:
-                # 공지사항은 건너뛰기 로직 필요할 수 있음
                 subject_div = row.select_one('.td_subject a')
                 if not subject_div: continue
 
-                link = subject_div['href']
                 title = subject_div.text.strip()
+                link = subject_div['href']
 
-                # wr_id 추출 로직
                 try:
                     wr_id = int(link.split('wr_id=')[1].split('&')[0])
-                except:
-                    continue
+                except: continue
 
-                # ID 갱신용 (가장 높은 번호 기억)
+                # 전체 중 가장 최신 ID 기록
                 if wr_id > found_max_id:
                     found_max_id = wr_id
 
-                # 신규 글이면서, 키워드가 포함된 경우
-                if wr_id > current_max_id:
-                    for keyword in config['keywords']:
+                # 진짜 신규 글 & 키워드 매칭
+                if wr_id > user['last_id']:
+                    for keyword in user['keywords']:
                         if keyword in title:
-                            msg = f"🔔 **[{region}] 키워드 '{keyword}' 발견!**\n{title}\n{link}"
-                            send_discord_alert(config['discord_url'], msg)
-                            print(f"알림 발송: {title}")
-                            break # 키워드 중복 알림 방지
-
+                            msg = f"🥋 **[{region}] 새 공고 알림**\n제목: {title}\n바로가기: {link}"
+                            send_discord(user['discord_url'], msg)
+                            new_posts_count += 1
+                            break
         except Exception as e:
-            print(f"에러 발생 ({region}): {e}")
+            print(f"에러 ({region}): {e}")
 
-    # 마지막 ID 업데이트 및 저장
-    if found_max_id > current_max_id:
-        config['last_id'] = found_max_id
-        save_config(config)
+    # 4. 상태 업데이트 (마지막 실행시간, 마지막 ID)
+    supabase.table('my_config').update({
+        'last_run_at': datetime.now(timezone.utc).isoformat(),
+        'last_id': found_max_id
+    }).eq('uid', 'admin').execute()
 
-# --- 메인 실행 ---
+    print(f"✅ 완료. 신규 알림: {new_posts_count}건, 갱신된 ID: {found_max_id}")
+
 if __name__ == "__main__":
-    while True:
-        config = load_config()
-
-        if config['is_active']:
-            crawl_job_board()
-        else:
-            print("🚫 기능이 꺼져있습니다. (Off)")
-
-        time.sleep(config['interval_seconds'])
+    main()

@@ -1,0 +1,23 @@
+name: Personal Crawler
+
+on:
+  schedule:
+    - cron: "*/5 * * * *" # 5분마다 깨어남 (DB 설정을 보고 실행 여부 결정)
+  workflow_dispatch: # 수동 실행 버튼
+
+jobs:
+  run-crawler:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Python Setup
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.9"
+      - name: Install Libs
+        run: pip install requests beautifulsoup4 supabase
+      - name: Run Script
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python crawler.py
