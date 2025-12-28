@@ -3,7 +3,6 @@ from supabase import create_client
 import time
 
 # --- Supabase 연결 (Secrets 사용) ---
-# 로컬 테스트 시 .streamlit/secrets.toml 파일 필요
 try:
     url = st.secrets["SUPABASE_URL"]
     key = st.secrets["SUPABASE_KEY"]
@@ -18,6 +17,8 @@ st.set_page_config(page_title="태권 알림봇 설정", layout="centered")
 # --- 세션 상태 초기화 (로그인 유지용) ---
 if 'is_logged_in' not in st.session_state:
     st.session_state['is_logged_in'] = False
+if 'user_id' not in st.session_state:
+    st.session_state['user_id'] = None
 
 # ==========================================
 # 1. 로그인 화면
@@ -34,6 +35,7 @@ if not st.session_state['is_logged_in']:
             res = supabase.table('my_config').select("*").eq('uid', input_id).execute()
             if res.data and res.data[0]['password'] == input_pw:
                 st.session_state['is_logged_in'] = True
+                st.session_state['user_id'] = input_id  # <--- 핵심 수정: 로그인한 ID 기억하기
                 st.success("로그인 성공!")
                 time.sleep(0.5)
                 st.rerun()
@@ -46,20 +48,23 @@ if not st.session_state['is_logged_in']:
 else:
     st.title("🥋 태권스토리 봇 제어판")
 
-    # DB에서 현재 설정 가져오기
-    res = st.session_state.get('user_data')
-    if not res:
-        res = supabase.table('my_config').select("*").eq('uid', 'admin').execute()
+    # 기억해둔 ID로 내 설정 가져오기
+    my_id = st.session_state['user_id']
+    res = supabase.table('my_config').select("*").eq('uid', my_id).execute() # <--- 수정됨 ('admin' 삭제)
 
     if not res.data:
-        st.error("DB 데이터를 불러오지 못했습니다.")
+        st.error(f"DB 데이터 오류: '{my_id}' 계정 정보를 찾을 수 없습니다.")
+        if st.button("재로그인"):
+            st.session_state['is_logged_in'] = False
+            st.rerun()
         st.stop()
 
     user_data = res.data[0]
 
     # --- 설정 폼 ---
     with st.form("config_form"):
-        st.subheader("1. 기본 상태")
+        st.subheader(f"설정 관리 ({user_data['uid']}님)") # 누구 설정인지 표시
+
         c1, c2 = st.columns(2)
         with c1:
             # ON/OFF 스위치
@@ -74,9 +79,10 @@ else:
 
         # 지역 선택
         region_list = ["서울", "경기", "인천", "부산", "대구", "광주", "대전", "울산", "세종", "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주", "전체"]
-        # DB에 저장된 값이 리스트에 없으면 에러나므로 필터링
-        valid_defaults = [r for r in user_data['regions'] if r in region_list]
-        new_regions = st.multiselect("지역 선택", region_list, default=valid_defaults)
+
+        # 저장된 지역 불러오기 (없는 지역이 있을 경우 에러 방지)
+        current_regions = [r for r in user_data['regions'] if r in region_list]
+        new_regions = st.multiselect("지역 선택", region_list, default=current_regions)
 
         # 키워드 입력
         kwd_str = ", ".join(user_data['keywords'])
@@ -98,7 +104,8 @@ else:
                 "discord_url": new_discord
             }
 
-            supabase.table('my_config').update(update_data).eq('uid', 'admin').execute()
+            # 내 ID로 업데이트
+            supabase.table('my_config').update(update_data).eq('uid', my_id).execute()
             st.success("✅ 설정이 저장되었습니다! 다음 크롤링부터 적용됩니다.")
             time.sleep(1)
             st.rerun()
@@ -106,4 +113,5 @@ else:
     # 로그아웃 버튼
     if st.button("로그아웃"):
         st.session_state['is_logged_in'] = False
+        st.session_state['user_id'] = None
         st.rerun()
